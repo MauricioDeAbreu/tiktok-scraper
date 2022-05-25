@@ -23,6 +23,7 @@ const url_1 = require("url");
 const constant_1 = __importDefault(require("../constant"));
 const helpers_1 = require("../helpers");
 const _ = __importStar(require("lodash"));
+const HTMLParser = __importStar(require("node-html-parser"));
 const core_1 = require("../core");
 class TikTokScraper extends events_1.EventEmitter {
     constructor({ download, filepath, filetype, proxy, strictSSL = true, asyncDownload, cli = false, event = false, progress = false, input, number, since, type, by_user_id = false, store_history = false, historyPath = '', noWaterMark = false, useTestEndpoints = false, fileName = '', timeout = 0, bulk = false, zip = false, test = false, hdVideo = false, webHookUrl = '', method = 'POST', headers, verifyFp = '', sessionList = [], }) {
@@ -231,7 +232,7 @@ class TikTokScraper extends events_1.EventEmitter {
         if (this.scrapeType !== 'trend' && !this.input) {
             return this.returnInitError('Missing input');
         }
-        console.log('version marker 4 | v2.0.2');
+        console.log('version v2.6');
         await this.mainLoop();
         if (this.event) {
             return this.emit('done', 'completed');
@@ -366,7 +367,7 @@ class TikTokScraper extends events_1.EventEmitter {
                 this.validHeaders = true;
             }
             const result = await this.scrapeData(query);
-            if (result.statusCode !== 0) {
+            if (result && result.statusCode !== 0) {
                 throw new Error(`Can't scrape more posts`);
             }
             const { hasMore, maxCursor, cursor } = result;
@@ -645,6 +646,7 @@ class TikTokScraper extends events_1.EventEmitter {
                 }
             }
         }
+        result.done = true;
         return result;
     }
     async getValidHeaders(url = '', signUrl = true, method = 'HEAD') {
@@ -749,7 +751,7 @@ class TikTokScraper extends events_1.EventEmitter {
         if (this.byUserId || this.idStore) {
             return {
                 secUid: '',
-                id: this.userIdStore,
+                id: this.input,
                 type: 1,
                 count: 30,
                 minCursor: 0,
@@ -779,24 +781,57 @@ class TikTokScraper extends events_1.EventEmitter {
         if (!this.input) {
             throw new Error(`Username is missing`);
         }
-        let url = `https://m.tiktok.com/node/share/user/@${this.input}?`;
-        let signature = await this.signGivenUrl(url);
+        let userAgent = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_3) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/80.0.3987.122 Safari/537.36';
+        let url = `https://www.tiktok.com/@${this.input}?`;
         const options = {
+            url: url,
             method: 'GET',
-            uri: `${url}&_signature=${signature}`
+            "rejectUnauthorized": false,
+            'headers': {
+                'User-Agent': userAgent,
+                'Connection': 'keep-alive',
+                "accept": "*/*",
+                "accept-language": "en-US,en;q=0.9",
+            }
         };
-        try {
-            const response = await this.request(options);
-            if (response) {
-                const userMetadata = JSON.parse(response);
-                return userMetadata.userInfo;
-            }
+        !_.isNil(this.proxy) ? _.extend(options, { proxy: this.proxy }) : '';
+        console.log('using proxy ...', this.proxy);
+        const response = await request_promise_1.default(url, options);
+        let root = HTMLParser.parse(response);
+        let appContext = root.querySelector('#SIGI_STATE');
+        if (appContext && appContext.text) {
+            let _json = JSON.parse(appContext.text).UserModule;
+            let profileData = Object.values(_.get(_json, `users`))[0];
+            let statsData = Object.values(_.get(_json, `stats`))[0];
+            let data = { user: {}, stats: {}, shareMeta: {} };
+            _.assign(data, { user: profileData });
+            _.assign(data, { stats: statsData });
+            return data;
         }
-        catch (err) {
-            if (err.statusCode === 404) {
-                throw new Error('User does not exist');
+        let parsedResponse = JSON.parse(response);
+        let emptyResponse = _.isEmpty(_.get(parsedResponse, 'userInfo'));
+        let statusCode = _.get(parsedResponse, 'statusCode');
+        if (!emptyResponse) {
+            const userMetadata = parsedResponse;
+            return userMetadata.userInfo;
+        }
+        if (emptyResponse) {
+            options['uri'] = `http://tiktok.com/@${this.input}`;
+            options['method'] = 'head';
+            options['resolveWithFullResponse'] = true;
+            try {
+                let headResponse = await request_promise_1.default(options);
+                statusCode = headResponse.statusCode;
             }
-            console.log(`API fork threw ${err}`);
+            catch (e) {
+                statusCode = Object(e)['statusCode'];
+            }
+            switch (statusCode) {
+                case 10202:
+                case 404: throw new Error(`${statusCode} User does not exist`);
+                case 200:
+                default: throw new Error(`${statusCode} transient error`);
+            }
         }
         throw new Error(`Can't extract user metadata from the html page. Make sure that user does exist and try to use proxy`);
     }
@@ -901,8 +936,46 @@ class TikTokScraper extends events_1.EventEmitter {
             throw new Error(`Can't extract video metadata: ${this.input}`);
         }
     }
+    async getVideoLink(url, regex, regexlvl2, targetRegex) {
+        if (targetRegex.exec(url)) {
+            return url;
+        }
+        let isShortLinkLvl = regex.exec(url) || regexlvl2.exec(url);
+        if (isShortLinkLvl) {
+            const userAgent = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_12_4) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/57.0.2987.133 Safari/537.36';
+            let headers = {
+                'User-Agent': userAgent,
+            };
+            var response = null;
+            await request_promise_1.default({
+                url: url,
+                headers: headers,
+                method: 'HEAD',
+                followAllRedirects: false,
+                followRedirect: false,
+            }).then(res => {
+                response = res.request.uri.href;
+            }).catch(e => {
+                response = e.response.location;
+            });
+            response = response.split('?')[0];
+            return response;
+        }
+    }
     async getVideoMetadata(url = '') {
-        const videoData = /tiktok.com\/(@[\w.-]+)\/video\/(\d+)/.exec(url || this.input);
+        let count = 0;
+        let shortLinkLvl1 = /vm.tiktok.com\/([\w.-]+)/;
+        let shortLinkLvl2 = /m.tiktok.com\/([\w.-]+)\/(\d+)/;
+        let targetLinkregex = /tiktok.com\/(@[\w.-]+)\/video\/(\d+)/;
+        while (!targetLinkregex.exec(url)) {
+            url = await this.getVideoLink(url || this.input, shortLinkLvl1, shortLinkLvl2, targetLinkregex);
+            count += 1;
+            console.log('url is', url);
+            if (count > 3) {
+                break;
+            }
+        }
+        const videoData = targetLinkregex.exec(url);
         if (videoData) {
             const videoUsername = videoData[1];
             const videoId = videoData[2];
@@ -914,6 +987,7 @@ class TikTokScraper extends events_1.EventEmitter {
             try {
                 const response = await this.request(options);
                 if (response.statusCode === 0) {
+                    response.itemInfo.itemStruct['longUrl'] = url;
                     return response.itemInfo.itemStruct;
                 }
             }
@@ -930,10 +1004,12 @@ class TikTokScraper extends events_1.EventEmitter {
             throw new Error(`Url is missing`);
         }
         let videoData = {};
-        if (html) {
+        if (false) {
+            console.log('getting getVideoMetadataFromHtml');
             videoData = await this.getVideoMetadataFromHtml();
         }
         else {
+            console.log('getting getVideoMetadataFromAPI');
             videoData = await this.getVideoMetadata();
         }
         const videoItem = {
@@ -967,6 +1043,7 @@ class TikTokScraper extends events_1.EventEmitter {
                 duration: videoData.music.duration,
             },
             imageUrl: videoData.video.cover,
+            longUrl: videoData.longUrl,
             videoUrl: videoData.video.playAddr,
             videoUrlNoWaterMark: '',
             videoApiUrlNoWaterMark: '',
